@@ -6,6 +6,8 @@ const AudioSocketServer = require('./audiosocket-server');
 const GroqService = require('./services/groq-service');
 const ElevenLabsService = require('./services/elevenlabs-service');
 const OpenRouterService = require('./services/openrouter-service');
+const fs = require('fs');
+const path = require('path');
 
 class CallManager {
   constructor(config) {
@@ -27,7 +29,25 @@ class CallManager {
     // Estado das sessões
     this.sessions = new Map();
 
+    // Carrega áudio pré-gravado da saudação
+    this.greetingAudio = null;
+    this.loadGreetingAudio();
+
     this.setupEventHandlers();
+  }
+
+  loadGreetingAudio() {
+    try {
+      const greetingPath = path.join(__dirname, '..', 'greeting.pcm');
+      if (fs.existsSync(greetingPath)) {
+        this.greetingAudio = fs.readFileSync(greetingPath);
+        console.log(`✅ Áudio de saudação carregado: ${this.greetingAudio.length} bytes`);
+      } else {
+        console.log('⚠️  Arquivo greeting.pcm não encontrado');
+      }
+    } catch (error) {
+      console.error('❌ Erro ao carregar áudio de saudação:', error.message);
+    }
   }
 
   setupEventHandlers() {
@@ -44,13 +64,17 @@ class CallManager {
         isProcessing: false,
         conversationStarted: false
       });
+    });
 
-      // Envia saudação inicial imediatamente
+    // Handshake completado - pode enviar áudio
+    this.audioServer.on('handshakeComplete', (sessionId) => {
+      console.log('✅ Handshake completado - enviando saudação...');
       this.sendGreeting(sessionId);
     });
 
     // Frame de áudio recebido
     this.audioServer.on('audioFrame', (sessionId, frame) => {
+      // Processa com IA
       this.handleAudioFrame(sessionId, frame);
     });
 
@@ -89,6 +113,8 @@ class CallManager {
     const audioToProcess = session.audioBuffer;
     session.audioBuffer = Buffer.alloc(0);
 
+    // Removido envio de silêncio - deixa o Asterisk aguardar
+
     try {
       // Converte PCM para WAV
       const wavBuffer = this.pcmToWav(audioToProcess);
@@ -115,7 +141,8 @@ class CallManager {
       // Envia áudio de volta para o Asterisk
       if (responseAudio.length > 0) {
         console.log('📡 Enviando áudio para Asterisk...');
-        this.audioServer.sendAudio(sessionId, responseAudio);
+        this.audioServer.stopSilence(sessionId);
+        await this.audioServer.sendAudio(sessionId, responseAudio);
       }
 
     } catch (error) {
@@ -133,35 +160,31 @@ class CallManager {
     }
 
     try {
-      console.log('👋 Enviando saudação inicial...');
+      console.log('👋 Enviando saudação pré-gravada...');
 
-      const greeting = 'Olá! Tudo bem? Sou a assistente virtual da empresa. Como posso ajudar você hoje?';
-
-      // Define prompt do sistema
-      this.openRouterService.setSystemPrompt(sessionId, `Você é um assistente de IA amigável fazendo uma ligação telefônica.
+      // Define prompt do sistema para vendas de precatórios
+      this.openRouterService.setSystemPrompt(sessionId, `Você é um assistente de IA da Addebitare fazendo uma ligação para comprar precatórios.
 
 Seu objetivo é:
+- Confirmar se a pessoa tem precatórios para vender
+- Qualificar o precatório (valor, tribunal, estado)
+- Agendar uma proposta comercial
 - Ser educado e profissional
 - Fazer perguntas diretas e objetivas
-- Ouvir atentamente as respostas
-- Não ser muito verboso (respostas curtas de 1-2 frases)
-- Adaptar-se ao tom da conversa
 
 Importante:
 - Sempre responda em português do Brasil
 - Mantenha as respostas curtas (máximo 30 palavras)
 - Seja natural e conversacional
-- Não use emojis ou símbolos especiais`);
+- Não use emojis ou símbolos especiais
+- Se a pessoa disser que não tem precatórios, agradeça e encerre educadamente`);
 
-      // Gera áudio da saudação
-      const greetingAudio = await this.elevenLabsService.textToSpeech(greeting);
-
-      // Verifica novamente se a sessão ainda existe antes de enviar
-      if (greetingAudio.length > 0 && this.sessions.has(sessionId)) {
-        this.audioServer.sendAudio(sessionId, greetingAudio);
-        console.log('✅ Saudação enviada');
-      } else if (!this.sessions.has(sessionId)) {
-        console.log('⚠️  Sessão encerrada durante geração da saudação');
+      // Envia áudio pré-gravado imediatamente (em frames de 20ms)
+      if (this.greetingAudio && this.sessions.has(sessionId)) {
+        await this.audioServer.sendAudio(sessionId, this.greetingAudio);
+        console.log('✅ Saudação completa enviada');
+      } else if (!this.greetingAudio) {
+        console.log('⚠️  Áudio de saudação não disponível');
       }
 
     } catch (error) {

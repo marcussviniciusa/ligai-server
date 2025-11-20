@@ -6,9 +6,15 @@
 const net = require('net');
 const { EventEmitter } = require('events');
 
-// AudioSocket Protocol UUIDs
-const AUDIOSOCKET_UUID = Buffer.from([
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+// AudioSocket Protocol Constants
+const KIND_HANDSHAKE = 0x00;
+const KIND_UUID = 0x01;
+const KIND_AUDIO = 0x10;
+
+// Cria handshake: [kind=0x00, size_hi=0x00, size_lo=0x10, UUID(16 bytes)]
+const AUDIOSOCKET_HANDSHAKE = Buffer.from([
+  KIND_HANDSHAKE, 0x00, 0x10,  // Cabeçalho: kind=0x00, size=16
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // UUID (16 bytes de zeros)
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 ]);
 
@@ -30,26 +36,41 @@ class AudioSocketServer extends EventEmitter {
         socket,
         audioBuffer: Buffer.alloc(0),
         slinBuffer: Buffer.alloc(0),
-        callId: null
+        callId: null,
+        silenceInterval: null,
+        audioInterval: null,
+        handshakeComplete: false
       };
 
       this.sessions.set(sessionId, session);
 
-      // Envia handshake UUID
-      socket.write(AUDIOSOCKET_UUID);
+      // Envia handshake
+      console.log('🤝 Enviando handshake...');
+      socket.write(AUDIOSOCKET_HANDSHAKE);
 
       socket.on('data', (data) => {
+        console.log(`📥 Recebido ${data.length} bytes de dados:`, data.toString('hex').substring(0, 60));
         this.handleData(sessionId, data);
       });
 
       socket.on('end', () => {
         console.log('📞 Conexão encerrada:', sessionId);
+        const sess = this.sessions.get(sessionId);
+        if (sess) {
+          if (sess.silenceInterval) clearInterval(sess.silenceInterval);
+          if (sess.audioInterval) clearInterval(sess.audioInterval);
+        }
         this.emit('callEnded', sessionId);
         this.sessions.delete(sessionId);
       });
 
       socket.on('error', (err) => {
         console.error('❌ Erro no socket:', err.message);
+        const sess = this.sessions.get(sessionId);
+        if (sess) {
+          if (sess.silenceInterval) clearInterval(sess.silenceInterval);
+          if (sess.audioInterval) clearInterval(sess.audioInterval);
+        }
         this.sessions.delete(sessionId);
       });
 
@@ -63,20 +84,49 @@ class AudioSocketServer extends EventEmitter {
 
   handleData(sessionId, data) {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
+    if (!session) {
+      console.log('⚠️  Sessão não encontrada para handleData:', sessionId);
+      return;
+    }
 
     // Adiciona ao buffer
     session.slinBuffer = Buffer.concat([session.slinBuffer, data]);
 
-    // Processa frames de 320 bytes (20ms de áudio)
-    const FRAME_SIZE = 320;
+    // Processa mensagens do protocolo AudioSocket
+    while (session.slinBuffer.length >= 3) {
+      // Lê cabeçalho (3 bytes)
+      const kind = session.slinBuffer[0];
+      const sizeHi = session.slinBuffer[1];
+      const sizeLo = session.slinBuffer[2];
+      const payloadSize = (sizeHi << 8) | sizeLo;
 
-    while (session.slinBuffer.length >= FRAME_SIZE) {
-      const frame = session.slinBuffer.slice(0, FRAME_SIZE);
-      session.slinBuffer = session.slinBuffer.slice(FRAME_SIZE);
+      // Verifica se temos a mensagem completa
+      if (session.slinBuffer.length < 3 + payloadSize) {
+        break; // Aguarda mais dados
+      }
 
-      // Emite frame de áudio para processamento
-      this.emit('audioFrame', sessionId, frame);
+      // Extrai payload
+      const payload = session.slinBuffer.slice(3, 3 + payloadSize);
+      session.slinBuffer = session.slinBuffer.slice(3 + payloadSize);
+
+      // Processa baseado no tipo
+      if (kind === KIND_UUID) {
+        // UUID de resposta do Asterisk
+        const uuid = payload.toString('hex');
+        console.log('🔑 UUID da chamada recebido:', uuid);
+        session.handshakeComplete = true;
+
+        // Emite evento indicando que pode começar a enviar áudio
+        this.emit('handshakeComplete', sessionId);
+
+      } else if (kind === KIND_AUDIO) {
+        // Frame de áudio
+        if (session.handshakeComplete) {
+          this.emit('audioFrame', sessionId, payload);
+        }
+      } else {
+        console.log(`⚠️  Tipo de mensagem desconhecido: 0x${kind.toString(16)}`);
+      }
     }
   }
 
@@ -84,21 +134,157 @@ class AudioSocketServer extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session || !session.socket) {
       console.error('❌ Sessão não encontrada:', sessionId);
+      return Promise.reject(new Error('Sessão não encontrada'));
+    }
+
+    if (!session.handshakeComplete) {
+      console.log('⚠️  Aguardando handshake completar antes de enviar áudio...');
+      return Promise.reject(new Error('Handshake não completado'));
+    }
+
+    // Para qualquer envio anterior
+    this.stopAudioSending(sessionId);
+
+    const FRAME_SIZE = 320; // 20ms de áudio PCM
+    const totalFrames = Math.ceil(audioData.length / FRAME_SIZE);
+
+    console.log(`📤 Enviando ${audioData.length} bytes de áudio (${totalFrames} frames em tempo real)...`);
+
+    return new Promise((resolve, reject) => {
+      let frameIndex = 0;
+
+      const intervalId = setInterval(() => {
+        const currentSession = this.sessions.get(sessionId);
+
+        if (!currentSession || !currentSession.socket) {
+          clearInterval(intervalId);
+          if (currentSession) {
+            currentSession.audioInterval = null;
+          }
+          reject(new Error('Sessão encerrada durante envio'));
+          return;
+        }
+
+        if (frameIndex >= totalFrames) {
+          clearInterval(intervalId);
+          if (currentSession) {
+            currentSession.audioInterval = null;
+          }
+          console.log(`✅ Áudio completo enviado (${frameIndex} frames)`);
+          resolve();
+          return;
+        }
+
+        try {
+          const start = frameIndex * FRAME_SIZE;
+          const end = Math.min(start + FRAME_SIZE, audioData.length);
+          let frame = audioData.slice(start, end);
+
+          // Se o último frame for menor que 320 bytes, completa com zeros
+          if (frame.length < FRAME_SIZE) {
+            const paddedFrame = Buffer.alloc(FRAME_SIZE, 0);
+            frame.copy(paddedFrame);
+            frame = paddedFrame;
+          }
+
+          // Cria mensagem AudioSocket com cabeçalho
+          const message = Buffer.alloc(3 + FRAME_SIZE);
+          message[0] = KIND_AUDIO;           // kind = audio
+          message[1] = (FRAME_SIZE >> 8) & 0xFF;  // size high byte (0x01)
+          message[2] = FRAME_SIZE & 0xFF;         // size low byte (0x40)
+          frame.copy(message, 3);
+
+          currentSession.socket.write(message);
+          frameIndex++;
+        } catch (err) {
+          console.error('❌ Erro ao enviar frame de áudio:', err.message);
+          clearInterval(intervalId);
+          if (currentSession) {
+            currentSession.audioInterval = null;
+          }
+          reject(err);
+        }
+      }, 20); // Envia um frame a cada 20ms (tempo real)
+
+      // Salva o intervalId na sessão para poder cancelar se necessário
+      session.audioInterval = intervalId;
+    });
+  }
+
+  stopAudioSending(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (session && session.audioInterval) {
+      clearInterval(session.audioInterval);
+      session.audioInterval = null;
+      console.log('🛑 Envio de áudio interrompido');
+    }
+  }
+
+  sendSilence(sessionId, durationMs = 1000) {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.socket) {
       return;
     }
 
-    try {
-      // AudioSocket espera PCM 8kHz 16-bit em frames de 320 bytes
-      session.socket.write(audioData);
-    } catch (err) {
-      console.error('❌ Erro ao enviar áudio:', err.message);
+    // Para qualquer silêncio anterior
+    this.stopSilence(sessionId);
+
+    // 8kHz 16-bit = 16000 bytes por segundo
+    // 320 bytes = 20ms de áudio
+    const framesNeeded = Math.floor(durationMs / 20);
+    const silenceFrame = Buffer.alloc(320, 0); // Frame de silêncio
+
+    console.log(`🔇 Iniciando envio de ${durationMs}ms de silêncio em tempo real...`);
+
+    let frameCount = 0;
+    const intervalId = setInterval(() => {
+      const currentSession = this.sessions.get(sessionId);
+
+      if (!currentSession || !currentSession.socket || frameCount >= framesNeeded) {
+        clearInterval(intervalId);
+        if (currentSession) {
+          currentSession.silenceInterval = null;
+        }
+        if (frameCount >= framesNeeded) {
+          console.log(`✅ Silêncio completo enviado (${frameCount} frames)`);
+        }
+        return;
+      }
+
+      try {
+        currentSession.socket.write(silenceFrame);
+        frameCount++;
+      } catch (err) {
+        console.error('❌ Erro ao enviar silêncio:', err.message);
+        clearInterval(intervalId);
+        if (currentSession) {
+          currentSession.silenceInterval = null;
+        }
+      }
+    }, 20); // Envia um frame a cada 20ms (tempo real)
+
+    // Salva o intervalId na sessão para poder cancelar se necessário
+    session.silenceInterval = intervalId;
+  }
+
+  stopSilence(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (session && session.silenceInterval) {
+      clearInterval(session.silenceInterval);
+      session.silenceInterval = null;
+      console.log('🛑 Envio de silêncio interrompido');
     }
   }
 
   endCall(sessionId) {
     const session = this.sessions.get(sessionId);
-    if (session && session.socket) {
-      session.socket.end();
+    if (session) {
+      // Limpa intervals se existirem
+      if (session.silenceInterval) clearInterval(session.silenceInterval);
+      if (session.audioInterval) clearInterval(session.audioInterval);
+      if (session.socket) {
+        session.socket.end();
+      }
       this.sessions.delete(sessionId);
     }
   }

@@ -1,0 +1,24 @@
+{
+  "name": "ligai",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@elevenlabs/elevenlabs-js": "^2.24.1",
+    "asterisk-manager": "^0.2.0",
+    "dotenv": "^17.2.3",
+    "elevenlabs": "^1.59.0",
+    "express": "^5.1.0",
+    "groq-sdk": "^0.36.0",
+    "openai": "^6.9.1",
+    "ws": "^8.18.3"
+  }
+}

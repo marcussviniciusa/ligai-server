@@ -62,7 +62,8 @@ class CallManager {
         lastSpeechTime: Date.now(),
         isSpeaking: false,
         isProcessing: false,
-        conversationStarted: false
+        conversationStarted: false,
+        isSendingGreeting: false
       });
     });
 
@@ -74,6 +75,13 @@ class CallManager {
 
     // Frame de áudio recebido
     this.audioServer.on('audioFrame', (sessionId, frame) => {
+      const session = this.sessions.get(sessionId);
+
+      // Ignora áudio enquanto envia saudação
+      if (session && session.isSendingGreeting) {
+        return;
+      }
+
       // Processa com IA
       this.handleAudioFrame(sessionId, frame);
     });
@@ -153,14 +161,19 @@ class CallManager {
   }
 
   async sendGreeting(sessionId) {
+    const session = this.sessions.get(sessionId);
+
     // Verifica se a sessão ainda existe
-    if (!this.sessions.has(sessionId)) {
+    if (!session) {
       console.log('⚠️  Sessão encerrada antes da saudação');
       return;
     }
 
     try {
       console.log('👋 Enviando saudação pré-gravada...');
+
+      // Marca que está enviando saudação (para ignorar áudio recebido)
+      session.isSendingGreeting = true;
 
       // Define prompt do sistema para vendas de precatórios
       this.openRouterService.setSystemPrompt(sessionId, `Você é um assistente de IA da Addebitare fazendo uma ligação para comprar precatórios.
@@ -182,13 +195,24 @@ Importante:
       // Envia áudio pré-gravado imediatamente (em frames de 20ms)
       if (this.greetingAudio && this.sessions.has(sessionId)) {
         await this.audioServer.sendAudio(sessionId, this.greetingAudio);
-        console.log('✅ Saudação completa enviada');
+        console.log('✅ Saudação completa enviada - aguardando resposta do cliente...');
+
+        // Marca que terminou de enviar (agora pode processar áudio)
+        if (this.sessions.has(sessionId)) {
+          session.isSendingGreeting = false;
+          // Limpa buffer de áudio que possa ter acumulado
+          session.audioBuffer = Buffer.alloc(0);
+        }
       } else if (!this.greetingAudio) {
         console.log('⚠️  Áudio de saudação não disponível');
+        session.isSendingGreeting = false;
       }
 
     } catch (error) {
       console.error('❌ Erro ao enviar saudação:', error.message);
+      if (session) {
+        session.isSendingGreeting = false;
+      }
     }
   }
 

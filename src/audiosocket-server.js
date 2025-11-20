@@ -120,10 +120,13 @@ class AudioSocketServer extends EventEmitter {
         this.emit('handshakeComplete', sessionId);
 
       } else if (kind === KIND_AUDIO) {
-        // Frame de áudio
+        // Frame de áudio - só processa se handshake completo
         if (session.handshakeComplete) {
           this.emit('audioFrame', sessionId, payload);
         }
+      } else if (kind === KIND_HANDSHAKE) {
+        // Ignora handshake duplicado
+        console.log('⚠️  Handshake duplicado recebido, ignorando');
       } else {
         console.log(`⚠️  Tipo de mensagem desconhecido: 0x${kind.toString(16)}`);
       }

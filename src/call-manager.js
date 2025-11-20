@@ -60,6 +60,7 @@ class CallManager {
       this.sessions.set(sessionId, {
         audioBuffer: Buffer.alloc(0),
         lastSpeechTime: Date.now(),
+        lastHighEnergyTime: null,
         isSpeaking: false,
         isProcessing: false,
         conversationStarted: false,
@@ -104,30 +105,53 @@ class CallManager {
 
     // Calcula energia do frame para detectar fala
     const energy = this.calculateAudioEnergy(frame);
-    const SPEECH_ENERGY_THRESHOLD = 50; // Ajustável: valores típicos 30-100
+    const SPEECH_ENERGY_THRESHOLD = 40; // Threshold para detectar fala
+    const SILENCE_TOLERANCE_MS = 700;   // Continua capturando por 700ms após fala parar
 
-    // Só acumula se houver energia suficiente (voz, não silêncio)
-    if (energy > SPEECH_ENERGY_THRESHOLD) {
+    const now = Date.now();
+
+    // Detecta se há fala neste frame
+    const hasSpeech = energy > SPEECH_ENERGY_THRESHOLD;
+
+    if (hasSpeech) {
+      // Fala detectada - atualiza timestamp
+      session.lastHighEnergyTime = now;
+    }
+
+    // Calcula há quanto tempo não detectamos fala
+    const timeSinceHighEnergy = session.lastHighEnergyTime
+      ? now - session.lastHighEnergyTime
+      : Infinity;
+
+    // Captura frame SE:
+    // 1. Houver fala agora OU
+    // 2. Detectamos fala recentemente (dentro da tolerância) E já estamos capturando
+    const shouldCapture = hasSpeech ||
+                          (session.lastHighEnergyTime &&
+                           timeSinceHighEnergy < SILENCE_TOLERANCE_MS &&
+                           session.audioBuffer.length > 0);
+
+    if (shouldCapture) {
       session.audioBuffer = Buffer.concat([session.audioBuffer, frame]);
-      session.lastSpeechTime = Date.now();
+      session.lastSpeechTime = now;
 
-      // Log para debug (pode remover depois)
-      if (session.audioBuffer.length % 3200 === 0) { // A cada 200ms
-        console.log(`🎙️  Capturando fala... ${(session.audioBuffer.length / 16000).toFixed(1)}s acumulados (energia: ${energy.toFixed(1)})`);
+      // Log para debug (a cada 200ms)
+      if (session.audioBuffer.length % 3200 === 0) {
+        console.log(`🎙️  Capturando... ${(session.audioBuffer.length / 16000).toFixed(1)}s (energia: ${energy.toFixed(1)})`);
       }
     }
 
-    // Processa quando tiver 2-3 segundos de FALA REAL (não silêncio)
-    const PROCESS_THRESHOLD = 20000; // 2.5 segundos de fala real
+    // Processa quando tiver 2-3 segundos de fala
+    const PROCESS_THRESHOLD = 20000; // 2.5 segundos
 
     if (session.audioBuffer.length >= PROCESS_THRESHOLD) {
       await this.processAudio(sessionId);
     }
 
-    // Timeout: se passou 5s desde última fala e tem algo no buffer, processa
-    const timeSinceLastSpeech = Date.now() - session.lastSpeechTime;
-    if (timeSinceLastSpeech > 5000 && session.audioBuffer.length > 8000) { // Min 0.5s de fala
-      console.log('⏱️  Timeout: processando áudio acumulado...');
+    // Timeout: se passou 1s desde última fala forte e tem algo no buffer, processa
+    if (session.audioBuffer.length > 8000 && // Min 0.5s de fala
+        timeSinceHighEnergy > 1000) {         // 1s de silêncio após fala
+      console.log(`⏱️  Fim de fala detectado (${(session.audioBuffer.length / 16000).toFixed(1)}s) - processando...`);
       await this.processAudio(sessionId);
     }
   }

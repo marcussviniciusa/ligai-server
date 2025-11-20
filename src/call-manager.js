@@ -63,7 +63,8 @@ class CallManager {
         isSpeaking: false,
         isProcessing: false,
         conversationStarted: false,
-        isSendingGreeting: false
+        isSendingGreeting: false,
+        isSendingResponse: false
       });
     });
 
@@ -77,8 +78,8 @@ class CallManager {
     this.audioServer.on('audioFrame', (sessionId, frame) => {
       const session = this.sessions.get(sessionId);
 
-      // Ignora áudio enquanto envia saudação
-      if (session && session.isSendingGreeting) {
+      // Ignora áudio enquanto IA está falando (evita echo)
+      if (session && (session.isSendingGreeting || session.isSendingResponse)) {
         return;
       }
 
@@ -101,16 +102,46 @@ class CallManager {
     const session = this.sessions.get(sessionId);
     if (!session || session.isProcessing) return;
 
-    // Acumula áudio
-    session.audioBuffer = Buffer.concat([session.audioBuffer, frame]);
-    session.lastSpeechTime = Date.now();
+    // Calcula energia do frame para detectar fala
+    const energy = this.calculateAudioEnergy(frame);
+    const SPEECH_ENERGY_THRESHOLD = 50; // Ajustável: valores típicos 30-100
 
-    // Processa a cada 3 segundos de áudio acumulado (24000 bytes @ 8kHz 16-bit)
-    const PROCESS_THRESHOLD = 24000; // 3 segundos
+    // Só acumula se houver energia suficiente (voz, não silêncio)
+    if (energy > SPEECH_ENERGY_THRESHOLD) {
+      session.audioBuffer = Buffer.concat([session.audioBuffer, frame]);
+      session.lastSpeechTime = Date.now();
+
+      // Log para debug (pode remover depois)
+      if (session.audioBuffer.length % 3200 === 0) { // A cada 200ms
+        console.log(`🎙️  Capturando fala... ${(session.audioBuffer.length / 16000).toFixed(1)}s acumulados (energia: ${energy.toFixed(1)})`);
+      }
+    }
+
+    // Processa quando tiver 2-3 segundos de FALA REAL (não silêncio)
+    const PROCESS_THRESHOLD = 20000; // 2.5 segundos de fala real
 
     if (session.audioBuffer.length >= PROCESS_THRESHOLD) {
       await this.processAudio(sessionId);
     }
+
+    // Timeout: se passou 5s desde última fala e tem algo no buffer, processa
+    const timeSinceLastSpeech = Date.now() - session.lastSpeechTime;
+    if (timeSinceLastSpeech > 5000 && session.audioBuffer.length > 8000) { // Min 0.5s de fala
+      console.log('⏱️  Timeout: processando áudio acumulado...');
+      await this.processAudio(sessionId);
+    }
+  }
+
+  calculateAudioEnergy(pcmBuffer) {
+    // Calcula RMS (Root Mean Square) do áudio PCM 16-bit
+    let sum = 0;
+    for (let i = 0; i < pcmBuffer.length; i += 2) {
+      // Lê sample de 16-bit little-endian
+      const sample = pcmBuffer.readInt16LE(i);
+      sum += sample * sample;
+    }
+    const rms = Math.sqrt(sum / (pcmBuffer.length / 2));
+    return rms;
   }
 
   async processAudio(sessionId) {
@@ -149,12 +180,27 @@ class CallManager {
       // Envia áudio de volta para o Asterisk
       if (responseAudio.length > 0) {
         console.log('📡 Enviando áudio para Asterisk...');
+
+        // Marca que está enviando resposta (ignora áudio recebido para evitar echo)
+        session.isSendingResponse = true;
+
         this.audioServer.stopSilence(sessionId);
         await this.audioServer.sendAudio(sessionId, responseAudio);
+
+        // Terminou de enviar resposta
+        if (this.sessions.has(sessionId)) {
+          session.isSendingResponse = false;
+          // Limpa buffer para não processar áudio capturado durante resposta
+          session.audioBuffer = Buffer.alloc(0);
+          console.log('✅ Resposta enviada - aguardando cliente falar...');
+        }
       }
 
     } catch (error) {
       console.error('❌ Erro ao processar áudio:', error.message);
+      if (session) {
+        session.isSendingResponse = false;
+      }
     }
 
     session.isProcessing = false;

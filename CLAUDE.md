@@ -56,18 +56,54 @@ asterisk -rx "module reload pbx_config.so"
 
 ## Architecture
 
-### Audio Flow Pipeline
+### Complete System Flow
 
 ```
-Client Phone → Asterisk → AudioSocket (TCP) → Node.js Server
-                                                    ↓
-                                    ┌──────────────┴──────────────┐
-                                    ↓                             ↓
-                            Incoming Audio                 Outgoing Audio
-                                    ↓                             ↑
-                            Groq Whisper STT              ElevenLabs TTS
-                                    ↓                             ↑
-                            OpenRouter AI Chat ────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ 1. Asterisk PBX (Dialplan)                                         │
+│    - Dial(PJSIP/1290#NUMBER@sip-trunk)  → Places outbound call     │
+│    - U(audio-socket-handler)             → Executes after answer   │
+│    - AudioSocket(UUID, 127.0.0.1:9092)   → Connects to Node.js     │
+└─────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ 2. AudioSocket Protocol (TCP on port 9092)                         │
+│    - Asterisk sends UUID (0x01)          → Handshake               │
+│    - Bidirectional audio frames (0x10)   → 320 bytes/20ms          │
+│    - Format: [kind, size_hi, size_lo, payload]                     │
+└─────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ 3. Node.js AudioSocket Server (audiosocket-server.js)              │
+│    - Receives UUID → emits 'handshakeComplete'                     │
+│    - Receives audio frames → emits 'audioFrame'                    │
+│    - Sends audio frames → writes to TCP socket                     │
+└─────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ 4. Call Manager (call-manager.js)                                  │
+│    - On handshakeComplete: Sends pre-recorded greeting (greeting.pcm)│
+│    - On audioFrame: Accumulates 2 seconds of audio → processes     │
+│    - Ignores audio while speaking (isSendingGreeting/Response)     │
+└─────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ 5. AI Processing Pipeline                                          │
+│                                                                     │
+│  Client Audio (PCM) → Groq Whisper STT → Text                      │
+│                              ↓                                      │
+│                    OpenRouter (Claude 3.5 Sonnet)                  │
+│                              ↓                                      │
+│                        AI Response Text                             │
+│                              ↓                                      │
+│                    ElevenLabs TTS → Audio (MP3)                    │
+│                              ↓                                      │
+│                  ffmpeg converts to PCM 8kHz                        │
+│                              ↓                                      │
+│              Send back via AudioSocket to Asterisk                 │
+│                              ↓                                      │
+│                    Client hears AI response                         │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Components
@@ -76,13 +112,17 @@ Client Phone → Asterisk → AudioSocket (TCP) → Node.js Server
 - Orchestrates the complete call flow
 - Manages session state and audio buffering
 - Coordinates between AudioSocket, STT, AI, and TTS services
-- Accumulates audio frames into 3-second chunks before processing
+- Accumulates audio frames into 2-second chunks before processing
+- Protects against echo: ignores incoming audio while speaking (`isSendingGreeting`, `isSendingResponse`)
+- Pre-loads greeting audio (`greeting.pcm`) for instant playback
 
 **AudioSocketServer** (`src/audiosocket-server.js`)
-- TCP server implementing Asterisk AudioSocket protocol
-- Receives/sends 320-byte PCM frames (20ms audio @ 8kHz 16-bit mono)
-- Emits events: `callStarted`, `audioFrame`, `callEnded`
-- Handles UUID handshake with Asterisk
+- TCP server implementing Asterisk AudioSocket protocol (RFC compliant)
+- **Passive handshake**: Waits for Asterisk to send UUID first
+- Receives 323-byte messages: 3-byte header + 320-byte PCM payload
+- Sends 323-byte messages: `[0x10, 0x01, 0x40, pcm(320)]`
+- Emits events: `handshakeComplete`, `audioFrame`, `callEnded`, `dtmf`
+- Properly handles HANGUP (0x00), UUID (0x01), AUDIO (0x10), DTMF (0x03), ERROR (0xFF)
 
 **Service Layer** (`src/services/`)
 - `groq-service.js`: Speech-to-text using Groq Whisper large-v3
@@ -91,24 +131,52 @@ Client Phone → Asterisk → AudioSocket (TCP) → Node.js Server
 
 ### Audio Format Specifications
 
-- **AudioSocket Protocol**: PCM 8kHz 16-bit mono, 320-byte frames (20ms)
-- **Processing Threshold**: 24,000 bytes (~3 seconds) before STT processing
-- **Asterisk Codecs**: ulaw, alaw, gsm
+- **AudioSocket Protocol**: PCM 8kHz 16-bit mono (signed linear, little-endian)
+- **Frame Size**: 320 bytes = 160 samples = 20ms of audio
+- **Frame Format**: `[kind(1), size_hi(1), size_lo(1), pcm_data(320)] = 323 bytes total`
+- **Processing Threshold**: 16,000 bytes (~2 seconds) before STT processing
+- **Asterisk Codecs**: slin (signed linear) at 8kHz
 - **TTS Output**: MP3 converted to PCM via ffmpeg
 
 ## Critical Implementation Details
 
+### AudioSocket Protocol Specification
+
+**Official Spec**: https://github.com/CyCoreSystems/audiosocket
+
+**Message Types**:
+- `0x00` - HANGUP: Terminate connection (3 bytes: 0x00 0x00 0x00)
+- `0x01` - UUID: Session identifier (3-byte header + 16-byte UUID)
+- `0x03` - DTMF: Touch-tone digit (3-byte header + 1 ASCII byte)
+- `0x10` - AUDIO: PCM audio at 8kHz (3-byte header + 320 bytes)
+- `0xFF` - ERROR: Error notification from Asterisk
+
+**Message Format**: `[kind, size_hi, size_lo, payload...]`
+- Header: 3 bytes (kind + 16-bit big-endian length)
+- Payload: Variable length
+
+**Handshake Flow** (CRITICAL):
+1. **Client connects** to Asterisk AudioSocket (port 9092)
+2. **Client DOES NOT send anything** - wait passively
+3. **Asterisk sends UUID**: `[0x01, 0x00, 0x10, uuid(16 bytes)]`
+4. **Client marks handshake complete** and can now send/receive audio
+5. **Audio frames**: `[0x10, 0x01, 0x40, pcm(320 bytes)]` bidirectionally
+
+**CRITICAL ERROR**: Sending `[0x00, 0x00, 0x10, ...]` as "handshake" is WRONG! This is a HANGUP command and causes "read ECONNRESET".
+
 ### AudioSocket Application Syntax
 
-The correct Asterisk dialplan syntax for AudioSocket is:
+The correct Asterisk dialplan syntax:
 ```
 AudioSocket(uuid,service)
 ```
 
-**Incorrect**: `AudioSocket(127.0.0.1:9092,${UNIQUEID})`
-**Correct**: `AudioSocket(550e8400-e29b-41d4-a716-446655440000,127.0.0.1:9092)`
+**Example**:
+```
+exten => s,1,AudioSocket(550e8400-e29b-41d4-a716-446655440000,127.0.0.1:9092)
+```
 
-The first parameter must be a valid UUID string, the second is the host:port.
+The first parameter is a UUID (for logging/tracking), second is the host:port.
 
 ### ElevenLabs API v2.x
 
@@ -129,13 +197,22 @@ const audioStream = await client.textToSpeech.convert(
 
 ### Session State Management
 
-Each call session maintains:
-- `audioBuffer`: Accumulated PCM frames before processing
+**AudioSocketServer session** (`audiosocket-server.js`):
+- `socket`: TCP socket connection to Asterisk
+- `slinBuffer`: Accumulates incoming bytes until full message received
+- `handshakeComplete`: Flag set after UUID received from Asterisk
+- `silenceInterval`: Timer for sending silence frames (if needed)
+- `audioInterval`: Timer for sending audio in 20ms intervals (real-time)
+
+**CallManager session** (`call-manager.js`):
+- `audioBuffer`: Accumulated PCM frames before processing (resets after STT)
 - `lastSpeechTime`: Timestamp for silence detection
 - `isProcessing`: Prevents concurrent audio processing
+- `isSendingGreeting`: Flag to ignore incoming audio while sending greeting
+- `isSendingResponse`: Flag to ignore incoming audio while AI is speaking
 - `conversationStarted`: Tracks if greeting was sent
 
-The CallManager tracks sessions by `sessionId` format: `IP:PORT` (e.g., `127.0.0.1:46000`)
+The CallManager tracks sessions by `sessionId` format: `IP:PORT` (e.g., `127.0.0.1:39374`)
 
 ### Asterisk Configuration Requirements
 
@@ -179,16 +256,73 @@ Provider: IP-based authentication (no username/password)
 
 Format for outbound calls: `1290#<full_number_with_country_code>`
 
-## Conversation Flow Timing
+## Conversation Flow Timing (Working Implementation)
 
-1. **Call Setup**: Asterisk dials number → PJSIP trunk → client answers
-2. **AudioSocket Connection**: Immediate after answer, AudioSocket handshake occurs
-3. **Greeting**: Sent immediately upon connection (no delay)
-4. **Audio Accumulation**: Waits for 3 seconds of audio (24,000 bytes)
-5. **Processing**: STT → AI → TTS pipeline (~300-700ms total latency)
-6. **Response**: Audio sent back via AudioSocket frames
+1. **Call Initiation** (~1-5s depending on carrier)
+   ```
+   asterisk -rx "channel originate Local/NUMBER@outbound-calls-ai application Wait 60"
+   ```
+   - Asterisk dials via PJSIP trunk (138.59.146.69)
+   - Tech prefix 1290# prepended automatically
+   - Client phone rings and answers
+
+2. **AudioSocket Handshake** (<50ms)
+   - Asterisk executes `U(audio-socket-handler)` after answer
+   - `AudioSocket(UUID, 127.0.0.1:9092)` connects to Node.js server
+   - Node.js awaits UUID passively (does NOT send first)
+   - Asterisk sends: `[0x01, 0x00, 0x10, UUID(16 bytes)]`
+   - Node.js emits `handshakeComplete` event
+   - Log: "🔑 UUID da chamada recebido: 550e8400..."
+
+3. **Greeting Playback** (~3.3 seconds)
+   - Pre-recorded `greeting.pcm` loaded at startup (53,500 bytes)
+   - Sent in 168 frames at 20ms intervals (real-time)
+   - Client hears: "Olá, aqui é da addebitare, você tem precatórios para vender?"
+   - `isSendingGreeting=true` during playback (ignores incoming audio)
+   - Log: "✅ Saudação completa enviada - aguardando resposta do cliente..."
+
+4. **Client Speaks** (variable duration)
+   - Asterisk sends audio frames continuously: `[0x10, 0x01, 0x40, PCM(320)]`
+   - Node.js accumulates frames in `audioBuffer`
+   - When buffer reaches 16,000 bytes (~2 seconds), triggers processing
+   - Silences (0x08 0x00 0x08...) and noise (0xf8 0xff...) are included
+
+5. **AI Processing Pipeline** (~2-5 seconds total)
+   - **STT** (500-1500ms): Groq Whisper large-v3 transcribes accumulated audio
+   - **AI** (300-1000ms): OpenRouter (Claude 3.5 Sonnet) generates response
+   - **TTS** (1000-3000ms): ElevenLabs converts text to MP3 → ffmpeg → PCM
+   - `isProcessing=true` prevents concurrent processing
+
+6. **AI Response Playback** (variable duration)
+   - Audio sent in frames at 20ms intervals (real-time)
+   - Example: 111,178 bytes = 348 frames = ~7 seconds of speech
+   - `isSendingResponse=true` during playback (prevents echo)
+   - Log: "✅ Resposta enviada - pronto para ouvir..."
+
+7. **Conversation Loop**
+   - Returns to step 4 (client speaks)
+   - Continues until client hangs up or Asterisk timeout
+   - Each exchange: listen (2s) → process (2-5s) → respond (variable)
 
 ## Common Issues and Solutions
+
+### "read ECONNRESET" Error - CONNECTION RESET
+**Symptoms**: Asterisk closes connection immediately, "❌ Erro no socket: read ECONNRESET"
+
+**Root Cause**: Sending `[0x00, 0x00, 0x10, ...]` as handshake. This is a HANGUP command (0x00)!
+
+**Solution**: DO NOT send anything on connection. Wait for Asterisk to send UUID first:
+```javascript
+// WRONG - sends hangup command:
+const HANDSHAKE = Buffer.from([0x00, 0x00, 0x10, /* UUID */]);
+socket.write(HANDSHAKE);
+
+// CORRECT - wait passively:
+socket.on('data', (data) => {
+  // Asterisk sends UUID first: [0x01, 0x00, 0x10, UUID...]
+  this.handleData(sessionId, data);
+});
+```
 
 ### "Failed to parse UUID" Error
 The dialplan is using incorrect AudioSocket syntax. UUID must be first parameter.
@@ -199,11 +333,41 @@ ElevenLabs v2.x requires `client.textToSpeech.convert()` not `client.generate()`
 ### "pbx_config declined to load"
 Check file permissions on `/etc/asterisk/extensions.conf` and ensure `pbx_lua.so` is not loaded.
 
-### Session Ends Before Greeting
-The greeting was being sent with a delay. It should be immediate upon `callStarted` event.
+### AI Cannot Understand Client / "Nenhum texto detectado"
+**Symptoms**: Whisper returns empty string, AI says "Desculpe, estou tendo dificuldade para entender"
 
-### Echo/Hearing Own Voice
-Using `application Echo` in the originate command reflects audio back. Use `application Wait 30` or `application Milliwatt` for testing.
+**Root Cause**: Accumulating too much silence with speech. 3-second threshold captures mostly silence frames (`0x08 0x00...`).
+
+**Solution**: Reduce threshold to 2 seconds (16,000 bytes) or implement VAD (Voice Activity Detection)
+
+### Echo / AI Hears Itself
+**Symptoms**: AI processes its own speech, responds to itself
+
+**Root Cause**: Not ignoring incoming audio while AI is speaking
+
+**Solution**: Use `isSendingResponse` flag:
+```javascript
+if (session.isSendingResponse) {
+  return; // Ignore audio while speaking
+}
+```
+
+### Audio Playback Too Fast / Protocol Violation
+**Symptoms**: All audio sent at once, Asterisk disconnects
+
+**Root Cause**: Sending all frames immediately instead of real-time
+
+**Solution**: Use `setInterval` with 20ms delay:
+```javascript
+setInterval(() => {
+  const frame = Buffer.alloc(323);
+  frame[0] = 0x10;           // kind = audio
+  frame[1] = 0x01;           // size_hi
+  frame[2] = 0x40;           // size_lo = 320
+  pcmData.copy(frame, 3);
+  socket.write(frame);
+}, 20); // Real-time: 20ms per frame
+```
 
 ## AI Prompt Customization
 

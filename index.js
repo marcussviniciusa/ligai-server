@@ -18,7 +18,9 @@ const config = {
     apiKey: process.env.GROQ_API_KEY
   },
   elevenLabs: {
-    apiKey: process.env.ELEVENLABS_API_KEY
+    apiKey: process.env.ELEVENLABS_API_KEY,
+    voiceId: process.env.ELEVENLABS_VOICE_ID || 'pNInz6obpgDQGcFmaJgB', // Adam (default)
+    modelId: process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2'  // Multilingual v2 (default)
   },
   openRouter: {
     apiKey: process.env.OPENROUTER_API_KEY,

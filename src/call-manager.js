@@ -20,7 +20,11 @@ class CallManager {
     );
 
     this.groqService = new GroqService(config.groq.apiKey);
-    this.elevenLabsService = new ElevenLabsService(config.elevenLabs.apiKey);
+    this.elevenLabsService = new ElevenLabsService(
+      config.elevenLabs.apiKey,
+      config.elevenLabs.voiceId,
+      config.elevenLabs.modelId
+    );
     this.openRouterService = new OpenRouterService(
       config.openRouter.apiKey,
       config.openRouter.model

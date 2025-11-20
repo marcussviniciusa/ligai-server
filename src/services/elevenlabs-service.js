@@ -6,9 +6,10 @@ const { ElevenLabsClient } = require('@elevenlabs/elevenlabs-js');
 const { Readable } = require('stream');
 
 class ElevenLabsService {
-  constructor(apiKey) {
+  constructor(apiKey, voiceId = 'pNInz6obpgDQGcFmaJgB', modelId = 'eleven_multilingual_v2') {
     this.client = new ElevenLabsClient({ apiKey });
-    this.voiceId = 'pNInz6obpgDQGcFmaJgB'; // Adam voice (Portuguese)
+    this.voiceId = voiceId; // Voice ID configurável
+    this.modelId = modelId; // Model ID configurável
   }
 
   /**
@@ -29,7 +30,7 @@ class ElevenLabsService {
         this.voiceId,  // Primeiro parâmetro: voiceId
         {              // Segundo parâmetro: opções
           text: text,
-          model_id: 'eleven_multilingual_v2',
+          model_id: this.modelId,
           voice_settings: {
             stability: 0.5,
             similarity_boost: 0.75,

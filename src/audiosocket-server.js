@@ -7,16 +7,12 @@ const net = require('net');
 const { EventEmitter } = require('events');
 
 // AudioSocket Protocol Constants
-const KIND_HANDSHAKE = 0x00;
-const KIND_UUID = 0x01;
-const KIND_AUDIO = 0x10;
-
-// Cria handshake: [kind=0x00, size_hi=0x00, size_lo=0x10, UUID(16 bytes)]
-const AUDIOSOCKET_HANDSHAKE = Buffer.from([
-  KIND_HANDSHAKE, 0x00, 0x10,  // Cabeçalho: kind=0x00, size=16
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // UUID (16 bytes de zeros)
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-]);
+// Baseado em: https://github.com/CyCoreSystems/audiosocket
+const KIND_HANGUP = 0x00;    // Terminate connection
+const KIND_UUID = 0x01;       // UUID identifier (16 bytes)
+const KIND_DTMF = 0x03;       // DTMF digit (1 ASCII byte)
+const KIND_AUDIO = 0x10;      // PCM audio 8kHz (320 bytes)
+const KIND_ERROR = 0xFF;      // Error notification
 
 class AudioSocketServer extends EventEmitter {
   constructor(host = '0.0.0.0', port = 9092) {
@@ -44,9 +40,8 @@ class AudioSocketServer extends EventEmitter {
 
       this.sessions.set(sessionId, session);
 
-      // Envia handshake
-      console.log('🤝 Enviando handshake...');
-      socket.write(AUDIOSOCKET_HANDSHAKE);
+      // NÃO enviamos nada! Aguardamos o Asterisk enviar o UUID primeiro
+      console.log('🤝 Aguardando UUID do Asterisk...');
 
       socket.on('data', (data) => {
         console.log(`📥 Recebido ${data.length} bytes de dados:`, data.toString('hex').substring(0, 60));
@@ -124,9 +119,19 @@ class AudioSocketServer extends EventEmitter {
         if (session.handshakeComplete) {
           this.emit('audioFrame', sessionId, payload);
         }
-      } else if (kind === KIND_HANDSHAKE) {
-        // Ignora handshake duplicado
-        console.log('⚠️  Handshake duplicado recebido, ignorando');
+      } else if (kind === KIND_HANGUP) {
+        // Asterisk está encerrando a conexão
+        console.log('☎️  Asterisk enviou HANGUP');
+        this.endCall(sessionId);
+      } else if (kind === KIND_DTMF) {
+        // DTMF digit
+        const digit = String.fromCharCode(payload[0]);
+        console.log(`📞 DTMF recebido: ${digit}`);
+        this.emit('dtmf', sessionId, digit);
+      } else if (kind === KIND_ERROR) {
+        // Error from Asterisk
+        const errorCode = payload.length > 0 ? payload[0] : 0;
+        console.log(`❌ Asterisk enviou erro: 0x${errorCode.toString(16)}`);
       } else {
         console.log(`⚠️  Tipo de mensagem desconhecido: 0x${kind.toString(16)}`);
       }
